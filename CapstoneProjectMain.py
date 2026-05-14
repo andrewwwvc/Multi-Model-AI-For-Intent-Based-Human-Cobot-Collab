@@ -4,6 +4,13 @@ Step 1: Press SPACE to record a voice command
 Step 2: spaCy matches the command semantically to a register value
 Step 3: Write the register value to the UR robot via RTDE
         and poll until the robot finishes or reports an error
+
+Install:
+    python3.11 -m pip install speechrecognition pyaudio keyboard spacy ur-rtde
+    python3.11 -m spacy download en_core_web_md
+
+Run:
+    sudo python3.11 CapstoneProject.py
 """
 
 import threading
@@ -15,15 +22,17 @@ import rtde_receive
 import rtde_io
 
 # -- Configuration -------------------------------------------------------------
-ROBOT_IP             = "192.168.1.112"   # <-- Your robot's IP
-ENERGY_THRESHOLD     = 300               # Mic sensitivity
-SIMILARITY_THRESHOLD = 0.70              # Minimum NLP match score (0.0 - 1.0)
-POLL_RATE            = 0.5               # Seconds between register polls
+ROBOT_IP = "192.168.1.112"      # Your robot's IP
+ENERGY_THRESHOLD = 300          # Mic sensitivity
+SIMILARITY_THRESHOLD = 0.70     # Minimum NLP match score (0.0 - 1.0)
+POLL_RATE = 0.5                 # Seconds between register polls
+MIC_NAME = "fifine"             # Partial name of your external microphone (case insensitive)
 
-# -- Register indices (must match your URScript) -------------------------------
-REG_COMMAND        = 18
-REG_STATUS         = 19
+# -- Register indices ----------------------------------------------------------
+REG_COMMAND = 18
+REG_STATUS = 19
 ERROR_PART_MISSING = 99
+STATUS_DONE = 1
 
 # -- Semantic Anchors ----------------------------------------------------------
 ANCHORS = {
@@ -35,6 +44,7 @@ ANCHORS = {
         "install the red light",
         "pick up the red part",
         "put in the red light",
+        "place the emergency light"
         "red light only",
     ],
     2: [
@@ -42,6 +52,7 @@ ANCHORS = {
         "place the yellow part",
         "place the yellow light",
         "assemble the yellow light",
+        "place the warning light"
         "install the yellow light",
         "pick up the yellow part",
         "put in the yellow light",
@@ -52,6 +63,8 @@ ANCHORS = {
         "place the green part",
         "place the green light",
         "assemble the green light",
+        "place the start light",
+        "place the power light",
         "install the green light",
         "pick up the green part",
         "put in the green light",
@@ -95,17 +108,61 @@ ANCHOR_DOCS = {
     for phrase in phrases
 }
 
+CANCEL_DOCS = {
+    word: nlp(word) for word in ANCHORS.get(0, [])
+}
+
 print("spaCy model loaded.\n")
+
+# -- Microphone Setup ----------------------------------------------------------
+def find_microphone_index(name_fragment):
+    """
+    Search available microphones for one whose name contains name_fragment.
+    Returns the device index, or None if not found.
+    """
+    mic_list = sr.Microphone.list_microphone_names()
+    print("Available microphones:")
+    for i, mic in enumerate(mic_list):
+        print(f"  [{i}] {mic}")
+    
+    matches = [i for i, mic in enumerate(mic_list) if name_fragment.lower() in mic.lower()]
+    if matches:
+        # Use the last match to avoid virtual/duplicate entries
+        i = matches[-1]
+        print(f"\nUsing microphone [{i}]: {mic_list[i]}\n")
+        return i
+    
+    print(f"\nWarning: '{name_fragment}' microphone not found. Using default mic.\n")
+    return None
+
+MIC_INDEX = find_microphone_index(MIC_NAME)
 
 # -- Speech Recognition Setup --------------------------------------------------
 recogniser = sr.Recognizer()
 recogniser.energy_threshold = ENERGY_THRESHOLD
 recogniser.dynamic_energy_threshold = False
 
+
+# -- RTDE Helpers --------------------------------------------------------------
+def read_reg(rtde_r, index):
+    return int(rtde_r.getOutputIntRegister(index))
+
+
+def write_reg(rtde_io_, index, value):
+    rtde_io_.setInputIntRegister(index, value)
+    print(f"Register[{index}] -> {value}")
+
+
+def clear_registers(rtde_io_):
+    write_reg(rtde_io_, REG_COMMAND, 0)
+    write_reg(rtde_io_, REG_STATUS, 0)
+
+
 # -- Step 1: Speech-to-Text ----------------------------------------------------
 def listen_for_command():
     """
     Wait for SPACE to start recording, SPACE again to stop.
+    Uses the Fifine microphone if found, otherwise falls back to default.
     Returns the recognised text, or None if nothing was understood.
     """
     print("Press SPACE to start recording ...")
@@ -113,24 +170,24 @@ def listen_for_command():
     print("Recording ... press SPACE to stop.")
 
     stop_event = threading.Event()
-    keyboard.on_press_key("space", lambda _: stop_event.set())
+    hook = keyboard.on_press_key("space", lambda _: stop_event.set())
 
     frames = []
 
-    with sr.Microphone() as source:
+    with sr.Microphone(device_index=MIC_INDEX) as source:
         recogniser.adjust_for_ambient_noise(source, duration=0.5)
+        sample_rate = source.SAMPLE_RATE
+        sample_width = source.SAMPLE_WIDTH
 
         while not stop_event.is_set():
             try:
                 chunk = recogniser.record(source, duration=0.5)
                 frames.append(chunk.get_raw_data())
-            except Exception:
+            except Exception as e:
+                print(f"Audio capture error: {e}")
                 break
 
-        sample_rate = source.SAMPLE_RATE
-        sample_width = source.SAMPLE_WIDTH
-
-    keyboard.unhook_all()
+    keyboard.unhook(hook)
 
     if not frames:
         print("No audio captured.")
@@ -152,79 +209,80 @@ def listen_for_command():
         print(f"STT request failed: {e}")
         return None
 
+
 # -- Step 2: Semantic NLP Matching ---------------------------------------------
 def get_best_match(user_input):
     """
     Compare the full voice command against every anchor phrase.
     Returns (register_value, matched_anchor, score).
     register_value is 0 if no anchor exceeds the threshold.
+    Also prints how long the NLP matching took.
     """
-    user_input_clean = user_input.lower()
+    nlp_start = time.perf_counter()
+
+    user_input_clean = user_input.lower().strip()
     doc = nlp(user_input_clean)
 
     best_score = 0.0
     best_anchor = ""
     best_reg = 0
 
+    # Check regular anchors (registers 1-4)
     for phrase, (reg_val, anchor_doc) in ANCHOR_DOCS.items():
+        if reg_val == 0:
+            continue
         score = doc.similarity(anchor_doc)
         if score > best_score and score >= SIMILARITY_THRESHOLD:
             best_score = score
             best_anchor = phrase
             best_reg = reg_val
 
+    # Check cancel anchors separately
+    for word, cancel_doc in CANCEL_DOCS.items():
+        score = doc.similarity(cancel_doc)
+        if score > best_score and score >= SIMILARITY_THRESHOLD:
+            best_score = score
+            best_anchor = "cancel"
+            best_reg = 0
+
+    nlp_elapsed = time.perf_counter() - nlp_start
+
+    if best_anchor:
+        print(f"NLP match time: {nlp_elapsed:.4f} seconds")
+    else:
+        print(f"NLP time: {nlp_elapsed:.4f} seconds (no match found)")
+
     return best_reg, best_anchor, best_score
 
-# -- Step 3: RTDE Register Read/Write ------------------------------------------
-def read_reg(rtde_r, index):
-    return int(rtde_r.getOutputIntRegister(index))
 
-def write_reg(rtde_io_, index, value):
-    rtde_io_.setInputIntRegister(index, value)
-    print(f"Register[{index}] -> {value}")
-
+# -- Step 3: Robot Sync --------------------------------------------------------
 def wait_for_robot(rtde_r, rtde_io_):
     """
-    Poll REG_STATUS (register 19) which the robot writes to signal completion:
-      1  = robot is done successfully
-      99 = robot encountered an error (part not found)
-    Python resets both registers after receiving the signal.
+    Simply notifies the user to wait for the robot to finish
+    before speaking the next command.
     """
-    print("Waiting for robot to finish ...")
+    print("\nWait for robot to finish task before speaking next command.\n")
+    return True
 
-    while True:
-        status = read_reg(rtde_r, REG_STATUS)
-
-        if status == 1:
-            print("Robot finished successfully.")
-            write_reg(rtde_io_, REG_COMMAND, 0)
-            write_reg(rtde_io_, REG_STATUS, 0)
-            return True
-
-        elif status == ERROR_PART_MISSING:
-            print("ERROR: Robot could not find a part.")
-            write_reg(rtde_io_, REG_COMMAND, 0)
-            write_reg(rtde_io_, REG_STATUS, 0)
-            return False
-
-        else:
-            print("Robot busy ...")
-
-        time.sleep(POLL_RATE)
 
 def send_command(rtde_r, rtde_io_, reg_value):
     """
-    Write command to register and wait for robot to finish.
-    Returns True on success, False on error.
+    Write command to register 18 and wait for robot to finish.
+    Returns True on success, False on error/busy.
     """
-    current = read_reg(rtde_r, REG_COMMAND)
+    current_command = read_reg(rtde_r, REG_COMMAND)
+    current_status = read_reg(rtde_r, REG_STATUS)
 
-    if current != 0:
-        print(f"Robot is busy (register = {current}). Command not sent.")
+    if current_command != 0 or current_status != 0:
+        print(
+            f"Robot is busy "
+            f"(command={current_command}, status={current_status}). Command not sent."
+        )
         return False
 
     write_reg(rtde_io_, REG_COMMAND, reg_value)
     return wait_for_robot(rtde_r, rtde_io_)
+
 
 # -- Main Loop -----------------------------------------------------------------
 if __name__ == "__main__":
@@ -236,73 +294,70 @@ if __name__ == "__main__":
 
     print("Connected to robot.\n")
 
-    # Clear register at startup to avoid stale values from previous runs
-    write_reg(rtde_io_, REG_COMMAND, 0)
-    write_reg(rtde_io_, REG_STATUS, 0)
+    # Clear stale values at startup
+    clear_registers(rtde_io_)
     print("Registers cleared.\n")
 
     try:
         print("Press SPACE to record a command. (Ctrl+C to quit)\n")
         print("Example commands:")
-        print("  'place the red light'     -> register 1")
-        print("  'place the yellow light'  -> register 2")
-        print("  'place the green light'   -> register 3")
-        print("  'run the full sequence'   -> register 4\n")
+        print("  'place the red light'      -> register 1")
+        print("  'place the yellow light'   -> register 2")
+        print("  'place the green light'    -> register 3")
+        print("  'run the full sequence'    -> register 4")
+        print("  'cancel'                   -> reset registers\n")
 
         while True:
-            # Step 1 - Listen / STT
             user_text = listen_for_command()
 
             if user_text is None:
                 print("Nothing heard - try again.\n")
                 continue
 
-            if user_text.lower() in ("quit", "exit", "stop listening"):
+            user_text_clean = user_text.lower().strip()
+
+            if user_text_clean in ("quit", "exit", "stop listening"):
                 print("Exit command heard. Goodbye!")
                 break
 
-            # Start timer AFTER recording/STT is done, BEFORE NLP matching begins
-            nlp_start_time = time.perf_counter()
+            # NLP matching with timer
+            reg_value, matched_anchor, score = get_best_match(user_text_clean)
 
-            # Step 2 - Match
-            reg_value, matched_anchor, score = get_best_match(user_text)
-
-            # Stop timer as soon as a key match to anchors is determined
-            nlp_elapsed_time = time.perf_counter() - nlp_start_time
-
+            # Handle cancel/reset
             if reg_value == 0 and matched_anchor == "cancel":
-                print(f"Cancel command heard - resetting all registers.")
-                print(f"NLP match time: {nlp_elapsed_time:.4f} seconds\n")
-                write_reg(rtde_io_, REG_COMMAND, 0)
-                write_reg(rtde_io_, REG_STATUS, 0)
+                print(f"Cancel command matched: '{matched_anchor}' (score={score:.2f})")
+                clear_registers(rtde_io_)
+                print("Registers reset. Ready for next command.\n")
                 continue
 
-            if reg_value == 0:
+            # No valid match
+            if matched_anchor == "":
                 print(
                     f"No confident match for '{user_text}' "
-                    f"(below {SIMILARITY_THRESHOLD:.0%} threshold)."
+                    f"(below {SIMILARITY_THRESHOLD:.0%} threshold). Try again.\n"
                 )
-                print(f"NLP match time: {nlp_elapsed_time:.4f} seconds\n")
                 continue
 
             print(
                 f"Matched '{user_text}' -> anchor='{matched_anchor}' "
                 f"(score={score:.2f}) -> register {reg_value}"
             )
-            print(f"NLP match time: {nlp_elapsed_time:.4f} seconds")
 
-            # Step 3 - Send to robot
             success = send_command(rtde_r, rtde_io_, reg_value)
 
             if success:
                 print("Work order complete. Ready for next command.\n")
             else:
-                print("Resetting register. Please check the robot.\n")
-                write_reg(rtde_io_, REG_COMMAND, 0)
+                print("Command failed or robot busy. Please check the robot.\n")
 
     except KeyboardInterrupt:
         print("\nStopped by user.")
+
     finally:
+        try:
+            clear_registers(rtde_io_)
+        except Exception:
+            pass
         rtde_r.disconnect()
         rtde_io_.disconnect()
         print("Disconnected.")
